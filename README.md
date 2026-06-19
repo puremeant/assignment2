@@ -20,9 +20,18 @@ Stock data: CRSP monthly returns (2017–2025), NYSE stocks only
 From https://wrds-www.wharton.upenn.edu/pages/get-data/center-research-security-prices-crsp/annual-update/stock-version-2/monthly-stock-file/
 Choose 'permno, ticker, mthcaldt, and mthret, primaryexch' as variables after reading variable description in Stock - Version 2 (CIZ)
 And extract data where 'primaryexch = N' (NYSE ONLY)
-Factor data: Fama-French 5 factors + Momentum (from Ken French Data Library)
 The stock dataset is automatically downloaded from Google Drive when running the code.
 
+Data: 
+First characteristic data:
+From
+
+Data: 
+First characteristic data:
+From
+
+
+---------------------------------------
 < Model, Objective, Algorithm >
 1. Model: linear prediction using many predictors
 - Objective: MSE plus Elastic Net penalty, with Huber robustification
