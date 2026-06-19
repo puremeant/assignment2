@@ -1,3 +1,7 @@
+특성 만들기: https://feng-cityuhk.github.io/EquityCharacteristics/
+저자 코드: https://github.com/xiubooth/ML_Codes/tree/master/Simu_Matlab
+Tidy: https://www.tidy-finance.org/blog/gu-kelly-xiu-replication/
+
 Project Overview:
 This project replicates the tables and figures of Gu, Kelly, and Xiu (2020), using U.S. stock data from 2017–2025. 
 
