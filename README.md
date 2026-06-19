@@ -22,3 +22,14 @@ Choose 'permno, ticker, mthcaldt, and mthret, primaryexch' as variables after re
 And extract data where 'primaryexch = N' (NYSE ONLY)
 Factor data: Fama-French 5 factors + Momentum (from Ken French Data Library)
 The stock dataset is automatically downloaded from Google Drive when running the code.
+
+< Model, Objective, Algorithm >
+1. Model: linear prediction using many predictors
+- Objective: MSE plus Elastic Net penalty, with Huber robustification
+- Algorithm: regularized regression path / cross-validation to choose penalty
+2. Model: average of many regression trees
+- Objective: reduce prediction error through tree splits
+- Algorithm: bootstrap aggregation and random predictor selection
+3. Model: nonlinear neural network with 2 or 4 hidden layers
+- Objective: minimize prediction loss, usually MSE or robust loss
+- Algorithm: backpropagation and stochastic gradient descent
