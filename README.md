@@ -26,7 +26,8 @@ Run the main script: python main.py
 - The dataset contains DATE, permno, 94 lagged firm characteristics, and sic2, where sic2 is the first two digits of the SIC code. The sic2 variable is used to construct industry dummy variables.
 
 3. Macroeconomic predictors are obtained from Amit Goyal’s updated Welch–Goyal predictor dataset from:
-- https://sites.google.com/view/agoyal145/homettps://sites.google.com/view/agoyal145/home
+- https://sites.google.com/view/agoyal145/home?authuser=0
+- https://docs.google.com/spreadsheets/d/1qwpl2R_DNujpU5YUkk8lacP1tTeMb9iJ/edit?usp=sharing&ouid=113571510202500088860&rtpof=true&sd=true
 - I use the monthly sheet from PredictorData2025.xlsx. Following Welch and Goyal (2008) and Gu, Kelly, and Xiu (2020), I construct eight macroeconomic predictors: dividend-price ratio (dp), earnings-price ratio (ep), book-to-market ratio (bm), net equity expansion (ntis), Treasury-bill rate (tbl), term spread (tms), default spread (dfy), and stock variance (svar).
 - The macroeconomic predictors are lagged by one month before merging with stock-level returns and characteristics.
 
