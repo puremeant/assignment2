@@ -15,21 +15,20 @@ How to Run:
 Install dependencies: pip install -r requirements.txt
 Run the main script: python main.py
 
-Data:
-Stock data: CRSP monthly returns (2017–2025), NYSE stocks only
-From https://wrds-www.wharton.upenn.edu/pages/get-data/center-research-security-prices-crsp/annual-update/stock-version-2/monthly-stock-file/
-Choose 'permno, ticker, mthcaldt, and mthret, primaryexch' as variables after reading variable description in Stock - Version 2 (CIZ)
-And extract data where 'primaryexch = N' (NYSE ONLY)
-The stock dataset is automatically downloaded from Google Drive when running the code.
+< Data Sources and Sample Construction >
+1. Stock return data are obtained from the CRSP monthly stock file, Stock Version 2 (CIZ), through WRDS:
+- https://wrds-www.wharton.upenn.edu/pages/get-data/center-research-security-prices-crsp/annual-update/stock-version-2/monthly-stock-file/
+- I use monthly U.S. common stock return data for NYSE-listed stocks. The selected CRSP variables are permno, ticker, mthcaldt, mthret, and primaryexch. Following the assignment requirement, I restrict the sample to NYSE stocks only by keeping observations with primaryexch = "N".
+- The stock dataset is automatically downloaded from Google Drive when running the code.
 
-Data: 
-First characteristic data:
-From
+2. Firm-level characteristics are obtained from the Gu, Kelly, and Xiu / Dacheng Xiu firm characteristics dataset from:
+- https://dachxiu.chicagobooth.edu/download/datashare.zip
+- The dataset contains DATE, permno, 94 lagged firm characteristics, and sic2, where sic2 is the first two digits of the SIC code. The sic2 variable is used to construct industry dummy variables.
 
-Data: 
-First characteristic data:
-From
-
+3. Macroeconomic predictors are obtained from Amit Goyal’s updated Welch–Goyal predictor dataset from:
+- https://sites.google.com/view/agoyal145/homettps://sites.google.com/view/agoyal145/home
+- I use the monthly sheet from PredictorData2025.xlsx. Following Welch and Goyal (2008) and Gu, Kelly, and Xiu (2020), I construct eight macroeconomic predictors: dividend-price ratio (dp), earnings-price ratio (ep), book-to-market ratio (bm), net equity expansion (ntis), Treasury-bill rate (tbl), term spread (tms), default spread (dfy), and stock variance (svar).
+- The macroeconomic predictors are lagged by one month before merging with stock-level returns and characteristics.
 
 ---------------------------------------
 < Model, Objective, Algorithm >
