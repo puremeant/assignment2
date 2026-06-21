@@ -4,7 +4,7 @@
 #    Sample restriction: primaryexch == "N" for NYSE stocks only.
 #
 # 2. Firm characteristics:
-#    Gu, Kelly, and Xiu / Dacheng Xiu datashare.csv.
+#    Gu, Kelly, and Xiu (GKX) / Dacheng Xiu datashare.csv.
 #    Contains DATE, permno, 94 lagged firm characteristics, and sic2.
 #
 # 3. Macro predictors:
