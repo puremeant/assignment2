@@ -1,0 +1,384 @@
+# Data sources:
+# 1. CRSP monthly stock file, Stock Version 2 (CIZ), WRDS.
+#    Variables: permno, ticker, mthcaldt, mthret, primaryexch.
+#    Sample restriction: primaryexch == "N" for NYSE stocks only.
+#
+# 2. Firm characteristics:
+#    Gu, Kelly, and Xiu / Dacheng Xiu datashare.csv.
+#    Contains DATE, permno, 94 lagged firm characteristics, and sic2.
+#
+# 3. Macro predictors:
+#    Amit Goyal updated Welch-Goyal PredictorData2025.xlsx.
+#    Monthly sheet used to construct dp, ep, bm, ntis, tbl, tms, dfy, and svar.
+#    Macro predictors are lagged by one month before merging.
+
+
+# Note:
+# CRSP returns and Welch-Goyal macro predictors are available through 2025.
+# However, the public Dacheng Xiu firm-characteristics file used here ends in December 2021.
+# Therefore, the final merged stock-level prediction sample ends in 2021, which is the longest feasible sample using the public GKX characteristic data.
+
+from pathlib import Path
+import gdown
+import numpy as np
+import pandas as pd
+import requests
+
+
+# ============================================================
+# Paths : Paths of input and output data are set here.
+# ============================================================
+
+BASE_DIR = Path(r"C:\Users\Assignment2")
+DATA_DIR = BASE_DIR / "data"
+OUTPUT_DIR = BASE_DIR / "output"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+FILES = {
+    "PredictorData2025.xlsx": {
+        "id": "1bjt6qHYdKKHbcXtDDhmrMzBDkeJKqIOY",
+        "type": "google_sheet",
+    },
+    "datashare.csv": {
+        "id": "1omwYGMGq32wsGNaC8C6mUrjUjspwOHNn",
+        "type": "drive_file",
+    },
+    "crsp_nyse_only_ML.csv": {
+        "id": "1rRJyxxKxrOtWMt0CBi6a5aBwCFEFw79c",
+        "type": "drive_file",
+    },
+}
+
+
+# ============================================================
+# Download : Download all input files from Google Drive
+# ============================================================
+
+def file_ok(path: Path) -> bool:
+    return path.exists() and path.stat().st_size > 0
+
+
+def download_files():
+    for filename, info in FILES.items():
+        out = DATA_DIR / filename
+
+        if file_ok(out):
+            print(f"Already exists, skip: {out}")
+            continue
+
+        if info["type"] == "google_sheet":
+            url = f"https://docs.google.com/spreadsheets/d/{info['id']}/export?format=xlsx"
+            r = requests.get(url, timeout=1200)
+            r.raise_for_status()
+            out.write_bytes(r.content)
+
+        else:
+            url = f"https://drive.google.com/uc?id={info['id']}"
+            gdown.download(url, str(out), quiet=False)
+
+        if not file_ok(out):
+            raise FileNotFoundError(f"Download failed: {out}")
+
+        print(f"Downloaded: {out}")
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def read_csv(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_csv(path)
+    except UnicodeDecodeError:
+        return pd.read_csv(path, encoding="latin1")
+
+
+def to_yyyymm(x: pd.Series) -> pd.Series:
+    s = x.astype(str).str.strip()
+    return s.str.slice(0, 6)
+
+
+def rank_to_minus1_plus1(x: pd.Series) -> pd.Series:
+    """
+    Monthly cross-sectional rank transformation of firm characteristics.
+    The authors' Q&A states:
+    "We do cross-section rank transformation on all firm characteristics
+    for each month (set values to [-1, 1])."
+    Missing firm characteristics are set to zero after the transformation,
+    following the same Q&A guidance.
+    """
+
+    ok = x.notna()
+    n = ok.sum()
+
+    out = pd.Series(np.nan, index=x.index)
+
+    if n == 0:
+        return out
+    if n == 1:
+        out.loc[ok] = 0.0
+        return out
+
+    r = x.loc[ok].rank(method="average")
+    out.loc[ok] = 2 * (r - 1) / (n - 1) - 1
+    return out
+
+
+def rf_to_decimal(x: pd.Series) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    if x.dropna().abs().median() > 0.1:
+        return x / 100
+    return x
+
+
+# ============================================================
+# Load CRSP
+# ============================================================
+
+def load_crsp() -> pd.DataFrame:
+    crsp = read_csv(DATA_DIR / "crsp_nyse_only_ML.csv")
+
+    need = ["PERMNO", "MthCalDt", "MthRet", "PrimaryExch"]
+    miss = [c for c in need if c not in crsp.columns]
+    if miss:
+        raise KeyError(f"Missing CRSP columns: {miss}")
+
+    crsp = crsp.rename(
+        columns={
+            "PERMNO": "permno",
+            "MthCalDt": "date",
+            "MthRet": "ret",
+            "PrimaryExch": "primaryexch",
+        }
+    )
+
+    crsp = crsp[crsp["primaryexch"].astype(str).str.upper().eq("N")].copy()
+
+    crsp["yyyymm"] = to_yyyymm(crsp["date"])
+    crsp["permno"] = pd.to_numeric(crsp["permno"], errors="coerce")
+    crsp["ret"] = pd.to_numeric(crsp["ret"], errors="coerce")
+
+    crsp = crsp.dropna(subset=["permno", "yyyymm", "ret"])
+    crsp["permno"] = crsp["permno"].astype(int)
+
+    crsp = crsp[["permno", "yyyymm", "ret", "primaryexch"]]
+
+    print("\nCRSP")
+    print(f"Rows: {len(crsp):,}")
+    print(f"Period: {crsp['yyyymm'].min()} to {crsp['yyyymm'].max()}")
+    print(f"Firms: {crsp['permno'].nunique():,}")
+
+    return crsp
+
+
+# ============================================================
+# Load GKX firm characteristics
+# ============================================================
+
+def load_characteristics() -> tuple[pd.DataFrame, list[str]]:
+    chars = read_csv(DATA_DIR / "datashare.csv")
+
+    need = ["permno", "DATE", "sic2"]
+    miss = [c for c in need if c not in chars.columns]
+    if miss:
+        raise KeyError(f"Missing characteristic columns: {miss}")
+
+    chars["yyyymm"] = to_yyyymm(chars["DATE"])
+    chars["permno"] = pd.to_numeric(chars["permno"], errors="coerce")
+    chars["sic2"] = pd.to_numeric(chars["sic2"], errors="coerce")
+
+    chars = chars.dropna(subset=["permno", "yyyymm"])
+    chars["permno"] = chars["permno"].astype(int)
+
+    char_cols = [
+        c for c in chars.columns
+        if c not in ["permno", "DATE", "yyyymm", "sic2"]
+    ]
+
+    if len(char_cols) != 94:
+        raise ValueError(f"Expected 94 firm characteristics, found {len(char_cols)}")
+
+    for c in char_cols:
+        chars[c] = pd.to_numeric(chars[c], errors="coerce")
+
+    print("\nFirm characteristics")
+    print(f"Rows: {len(chars):,}")
+    print(f"Period: {chars['yyyymm'].min()} to {chars['yyyymm'].max()}")
+    print(f"Number of characteristics: {len(char_cols)}")
+
+    print("\nRank-normalizing characteristics...")
+    chars[char_cols] = (
+        chars.groupby("yyyymm", group_keys=False)[char_cols]
+        .transform(rank_to_minus1_plus1)
+        .fillna(0.0)
+    )
+
+    return chars[["permno", "yyyymm", "sic2"] + char_cols], char_cols
+
+
+# ============================================================
+# Load Welch-Goyal macro predictors
+# ============================================================
+
+def load_macro() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    macro = pd.read_excel(DATA_DIR / "PredictorData2025.xlsx", sheet_name="Monthly")
+
+    need = [
+        "yyyymm", "Index", "D12", "E12", "b/m",
+        "tbl", "AAA", "BAA", "lty", "ntis", "Rfree", "svar"
+    ]
+    miss = [c for c in need if c not in macro.columns]
+    if miss:
+        raise KeyError(f"Missing macro columns: {miss}")
+
+    macro["yyyymm"] = macro["yyyymm"].astype(int).astype(str).str.zfill(6)
+
+    for c in need:
+        if c != "yyyymm":
+            macro[c] = pd.to_numeric(macro[c], errors="coerce")
+
+    rf = macro[["yyyymm", "Rfree"]].rename(columns={"Rfree": "rf"})
+    rf["rf"] = rf_to_decimal(rf["rf"])
+
+    macro["macro_dp"] = np.log(macro["D12"] / macro["Index"])
+    macro["macro_ep"] = np.log(macro["E12"] / macro["Index"])
+    macro["macro_bm"] = macro["b/m"]
+    macro["macro_ntis"] = macro["ntis"]
+    macro["macro_tbl"] = macro["tbl"]
+    macro["macro_tms"] = macro["lty"] - macro["tbl"]
+    macro["macro_dfy"] = macro["BAA"] - macro["AAA"]
+    macro["macro_svar"] = macro["svar"]
+
+    macro_cols = [
+        "macro_dp", "macro_ep", "macro_bm", "macro_ntis",
+        "macro_tbl", "macro_tms", "macro_dfy", "macro_svar"
+    ]
+
+    macro = macro.sort_values("yyyymm")
+    macro[macro_cols] = macro[macro_cols].shift(1)
+    macro = macro[["yyyymm"] + macro_cols]
+
+    print("\nMacro predictors")
+    print(f"Period: {macro['yyyymm'].min()} to {macro['yyyymm'].max()}")
+    print(f"Number of macro predictors: {len(macro_cols)}")
+
+    return macro, rf, macro_cols
+
+
+# ============================================================
+# Build model data
+# ============================================================
+
+def build_data() -> tuple[pd.DataFrame, list[str]]:
+    crsp = load_crsp()
+    chars, char_cols = load_characteristics()
+    macro, rf, macro_cols = load_macro()
+
+    df = crsp.merge(rf, on="yyyymm", how="left")
+    df["excess_ret"] = df["ret"] - df["rf"]
+
+    df = df.merge(chars, on=["permno", "yyyymm"], how="inner")
+    df = df.merge(macro, on="yyyymm", how="left")
+
+    df = df.dropna(subset=["excess_ret"] + macro_cols)
+    df = df[(df["yyyymm"] >= "197101") & (df["yyyymm"] <= "202112")].copy()
+
+    print("\nMerged base data")
+    print(f"Rows: {len(df):,}")
+    print(f"Period: {df['yyyymm'].min()} to {df['yyyymm'].max()}")
+    print(f"Firms: {df['permno'].nunique():,}")
+
+    df["sic2"] = df["sic2"].astype("Int64").astype(str)
+    df.loc[df["sic2"].eq("<NA>"), "sic2"] = "missing"
+
+    sic = pd.get_dummies(df["sic2"], prefix="sic2", dtype=np.int8)
+    sic_cols = list(sic.columns)
+
+    interaction_list = []
+    for m in macro_cols:
+        temp = df[char_cols].multiply(df[m], axis=0)
+        temp.columns = [f"{c}_x_{m}" for c in char_cols]
+        interaction_list.append(temp)
+
+    interactions = pd.concat(interaction_list, axis=1)
+    interaction_cols = list(interactions.columns)
+
+    id_cols = ["permno", "yyyymm", "ret", "rf", "excess_ret", "primaryexch", "sic2"]
+
+    final_df = pd.concat(
+        [
+            df[id_cols].reset_index(drop=True),
+            df[char_cols].reset_index(drop=True),
+            interactions.reset_index(drop=True),
+            sic.reset_index(drop=True),
+        ],
+        axis=1,
+    )
+
+    predictor_cols = char_cols + interaction_cols + sic_cols
+
+    print("\nFinal model data")
+    print(f"Rows: {len(final_df):,}")
+    print(f"Columns: {final_df.shape[1]:,}")
+    print(f"Predictors: {len(predictor_cols):,}")
+    print(f"Characteristics: {len(char_cols)}")
+    print(f"Interactions: {len(interaction_cols)}")
+    print(f"SIC dummies: {len(sic_cols)}")
+
+    return final_df, predictor_cols
+
+
+# ============================================================
+# Save
+# ============================================================
+
+def save_data(final_df: pd.DataFrame, predictor_cols: list[str]) -> None:
+    df_2016 = final_df[
+        (final_df["yyyymm"] >= "197101") & (final_df["yyyymm"] <= "201612")
+    ].copy()
+
+    df_2021 = final_df[
+        (final_df["yyyymm"] >= "197101") & (final_df["yyyymm"] <= "202112")
+    ].copy()
+
+    path_2016 = OUTPUT_DIR / "gkx_model_data_1971_2016.parquet"
+    path_2021 = OUTPUT_DIR / "gkx_model_data_1971_2021.parquet"
+    sample_path = OUTPUT_DIR / "gkx_model_data_1971_2021_sample.csv"
+    predictors_path = OUTPUT_DIR / "predictor_columns.txt"
+
+    df_2016.to_parquet(path_2016, index=False)
+    df_2021.to_parquet(path_2021, index=False)
+    df_2021.head(5000).to_csv(sample_path, index=False)
+
+    with open(predictors_path, "w", encoding="utf-8") as f:
+        for c in predictor_cols:
+            f.write(c + "\n")
+
+    print("\nSaved files")
+    print(path_2016)
+    print(path_2021)
+    print(sample_path)
+    print(predictors_path)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    print("BASE_DIR:", BASE_DIR)
+    print("DATA_DIR:", DATA_DIR)
+    print("OUTPUT_DIR:", OUTPUT_DIR)
+
+    download_files()
+    final_df, predictor_cols = build_data()
+    save_data(final_df, predictor_cols)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
