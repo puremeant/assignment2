@@ -38,7 +38,8 @@ from sklearn.preprocessing import StandardScaler
 # 0. Settings
 # ============================================================
 
-BASE_DIR = Path(r"C:\Users\Assignment2")
+#### put your own path ###
+BASE_DIR = Path(r"C:\Users\Soojungkim\Assignment2")
 
 DATA_2021 = BASE_DIR / "output" / "gkx_model_data_1971_2021.parquet"
 
