@@ -1,0 +1,803 @@
+# Reduced-sample Table 1 + Figure 4 replication.
+#
+# Reduced-sample design:
+# Initial training:   2000-2011
+# Initial validation: 2012-2016
+# OOS testing:        2017-2021
+#
+# For each OOS year, the training window expands by one year and the 5-year validation window rolls forward by one year.
+#
+# Table 1:
+# Models are trained, tuned on the rolling validation window, and used to generate OOS stock-level excess return predictions.
+#
+# Figure 4:
+# Variable importance is computed using the same fitted models used for Table 1.
+# For each fitted model, each predictor column is set to zero one at a time while holding the fitted model fixed.
+# The variable importance score is the decrease in in-sample panel R2.
+#
+# This is predictor-level VI.  Therefore, raw characteristics, macro interaction terms, and sic2 dummies can all appear in Figure 4 if they are among the top predictors.
+
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import clone
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LinearRegression, SGDRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+# ============================================================
+# 0. Settings
+# ============================================================
+
+BASE_DIR = Path(r"C:\Users\Assignment2")
+
+DATA_2021 = BASE_DIR / "output" / "gkx_model_data_1971_2021.parquet"
+
+RESULT_DIR = BASE_DIR / "results"
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+RANDOM_STATE = 42
+
+SAMPLE_PERIOD = "2000_2021_reduced"
+
+SAMPLE_START = 2000
+FIRST_OOS_YEAR = 2017
+FINAL_OOS_YEAR = 2021
+VALIDATION_YEARS = 5
+
+OLS3_COLS = ["mvel1", "bm", "mom12m"]
+
+TABLE1_MODELS = [
+    "OLS+H",
+    "OLS-3+H",
+    "PCR",
+    "ENet+H",
+    "RF",
+    "NN2",
+    "NN4",
+]
+
+FIGURE4_MODELS = [
+    "PCR",
+    "ENet+H",
+    "RF",
+    "NN2",
+    "NN4",
+]
+
+# Full reduced-sample estimation.
+# Set these to smaller numbers only if the full run is too slow.
+MAX_TRAIN_ROWS = None
+MAX_VIP_ROWS = None
+
+TOP_N_FIG4 = 20
+
+
+# ============================================================
+# 1. Utility functions
+# ============================================================
+
+# Convert model names into file-safe names.
+def safe_model_name(model_name: str) -> str:
+    return model_name.replace("+", "plus").replace("-", "_")
+
+# Shorten long interaction predictor names for plotting.
+def shorten_predictor_label(col: str) -> str:
+    """
+    Make interaction names shorter for plotting.
+
+    Examples:
+    mom1m_x_macro_dp   -> mom1mdp
+    mvel1_x_macro_svar -> mvel1svar
+    sic2_35            -> sic2_35
+    """
+    return col.replace("_x_macro_", "")
+
+# Select model predictor columns by excluding identifiers, dates, and outcome variables.
+def get_predictor_columns(df: pd.DataFrame) -> list[str]:
+    non_predictors = {
+        "permno",
+        "yyyymm",
+        "year",
+        "ret",
+        "rf",
+        "excess_ret",
+        "primaryexch",
+        "sic2",
+    }
+    return [c for c in df.columns if c not in non_predictors]
+
+# Check that the three OLS-3 predictors are available.
+def check_ols3_columns(predictor_cols: list[str]) -> list[str]:
+    missing = [c for c in OLS3_COLS if c not in predictor_cols]
+    if missing:
+        raise KeyError(f"Missing OLS-3 columns: {missing}")
+
+    print(f"OLS-3+H columns: {OLS3_COLS}")
+    return OLS3_COLS
+
+# Optionally subsample rows for computational feasibility. (If MAX_ROWS = None, this is skipped.)
+def sample_xy(X: pd.DataFrame, y: pd.Series, max_rows: int | None):
+    if max_rows is None or len(X) <= max_rows:
+        return X, y
+
+    idx = X.sample(n=max_rows, random_state=RANDOM_STATE).index
+    return X.loc[idx], y.loc[idx]
+
+# Compute validation RMSE.
+def rmse_score(y_true, y_pred) -> float:
+    mse = mean_squared_error(y_true, y_pred)
+    return np.sqrt(mse)
+
+# Compute panel predictive R2 using zero excess return as the benchmark.
+def r2_zero_benchmark(y_true, y_pred) -> float:
+    """
+    Panel R2 with zero-prediction benchmark:
+    R2 = 1 - sum((y - yhat)^2) / sum(y^2)
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    denom = np.sum(y_true ** 2)
+    if denom == 0:
+        return np.nan
+
+    return 1 - np.sum((y_true - y_pred) ** 2) / denom
+
+
+# ============================================================
+# 2. Model grids
+# ============================================================
+
+# Build the hyperparameter candidate grid for each model.
+def get_model_grid(model_name: str):
+    """
+    Validation-based model selection.
+
+    OLS+H and OLS-3+H:
+    Huber-loss linear models implemented using SGDRegressor(loss="huber") for computational feasibility.
+
+    ENet+H:
+    Huber loss with elastic-net penalty.
+
+    RF:
+    n_estimators=100 for reduced computation.
+
+    NN:
+    The rolling validation window is used for hyperparameter selection.
+    """
+    if model_name == "OLS+H":
+        return [
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", SGDRegressor(
+                    loss="huber",
+                    penalty=None,
+                    epsilon=0.01,
+                    learning_rate="optimal",
+                    max_iter=500,
+                    tol=1e-4,
+                    random_state=RANDOM_STATE,
+                )),
+            ])
+        ]
+
+    if model_name == "OLS-3+H":
+        return [
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", SGDRegressor(
+                    loss="huber",
+                    penalty=None,
+                    epsilon=0.01,
+                    learning_rate="optimal",
+                    max_iter=500,
+                    tol=1e-4,
+                    random_state=RANDOM_STATE,
+                )),
+            ])
+        ]
+
+    if model_name == "PCR":
+        return [
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("pca", PCA(n_components=k, random_state=RANDOM_STATE)),
+                ("model", LinearRegression()),
+            ])
+            for k in [5, 10, 15, 30, 50]
+        ]
+
+    if model_name == "ENet+H":
+        return [
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", SGDRegressor(
+                    loss="huber",
+                    penalty="elasticnet",
+                    alpha=alpha,
+                    l1_ratio=l1_ratio,
+                    epsilon=0.01,
+                    learning_rate="optimal",
+                    max_iter=500,
+                    tol=1e-4,
+                    random_state=RANDOM_STATE,
+                )),
+            ])
+            for alpha in [1e-4, 1e-3, 1e-2]
+            for l1_ratio in [0.25, 0.50, 0.75]
+        ]
+
+    if model_name == "RF":
+        # return [
+        #     RandomForestRegressor(
+        #         n_estimators=300,
+        #         max_features=mtry,
+        #         max_depth=depth,
+        #         min_samples_leaf=50,
+        #         n_jobs=-1,
+        #         random_state=RANDOM_STATE,
+        #     )
+        #     for mtry in [5, 10, 20, 30]
+        #     for depth in [2, 3, 4, 5, 6]
+        # ]
+
+        return [
+            RandomForestRegressor(
+                n_estimators=300,
+                max_features=1,
+                max_depth=1,
+                min_samples_leaf=1,
+                n_jobs=-1,
+                random_state=RANDOM_STATE,
+            )
+        ]
+
+    if model_name == "NN2":
+        return [
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", MLPRegressor(
+                    hidden_layer_sizes=(32, 16),
+                    activation="relu",
+                    solver="adam",
+                    learning_rate_init=lr,
+                    alpha=penalty,
+                    batch_size=10000,
+                    max_iter=100,
+                    early_stopping=True,
+                    n_iter_no_change=5,
+                    validation_fraction=0.1,
+                    random_state=RANDOM_STATE,
+                )),
+            ])
+            for lr in [0.001, 0.01]
+            for penalty in [1e-5, 1e-3]
+        ]
+
+    if model_name == "NN4":
+        return [
+            Pipeline([
+                ("scaler", StandardScaler()),
+                ("model", MLPRegressor(
+                    hidden_layer_sizes=(32, 16, 8, 4),
+                    activation="relu",
+                    solver="adam",
+                    learning_rate_init=lr,
+                    alpha=penalty,
+                    batch_size=10000,
+                    max_iter=100,
+                    early_stopping=True,
+                    n_iter_no_change=5,
+                    validation_fraction=0.1,
+                    random_state=RANDOM_STATE,
+                )),
+            ])
+            for lr in [0.001, 0.01]
+            for penalty in [1e-5, 1e-3]
+        ]
+
+    raise ValueError(f"Unknown model name: {model_name}")
+
+# Select the best hyperparameter candidate based on validation RMSE
+def tune_model(model_name: str, X_train, y_train, X_val, y_val):
+    candidates = get_model_grid(model_name)
+
+    best_template = None
+    best_rmse = np.inf
+    best_idx = None
+
+    for i, template in enumerate(candidates):
+        model = clone(template)
+
+        try:
+            model.fit(X_train, y_train)
+            pred_val = model.predict(X_val)
+            val_rmse = rmse_score(y_val, pred_val)
+
+            if val_rmse < best_rmse:
+                best_rmse = val_rmse
+                best_template = template
+                best_idx = i
+
+        except Exception as e:
+            print(f"Candidate failed | model={model_name}, idx={i}, error={e}")
+
+    if best_template is None:
+        raise RuntimeError(f"All candidates failed for {model_name}")
+
+    print(f"Best {model_name} candidate index: {best_idx}, validation RMSE: {best_rmse:.8f}")
+
+    return best_template, best_rmse, best_idx
+
+
+# ============================================================
+# 3. Estimation periods
+# ============================================================
+
+# Create expanding-window training and rolling-window validation periods.
+def create_estimation_periods() -> pd.DataFrame:
+    rows = []
+
+    for oos_year in range(FIRST_OOS_YEAR, FINAL_OOS_YEAR + 1):
+        validation_end = oos_year - 1
+        validation_start = oos_year - VALIDATION_YEARS
+        training_start = SAMPLE_START
+        training_end = validation_start - 1
+
+        rows.append({
+            "oos_year": oos_year,
+            "training_start": training_start,
+            "training_end": training_end,
+            "validation_start": validation_start,
+            "validation_end": validation_end,
+        })
+
+    periods = pd.DataFrame(rows)
+
+    print("\nEstimation periods:")
+    print(periods)
+
+    return periods
+
+
+# ============================================================
+# 4. Figure 4 predictor-level R2-VIP
+# ============================================================
+
+# Compute predictor-level R2-VIP by zeroing out each predictor one at a time.
+def compute_r2_vip_for_model(
+    fitted_model,
+    X_fit: pd.DataFrame,
+    y_fit: pd.Series,
+    vip_predictor_cols: list[str],
+    model_name: str,
+    oos_year: int,
+    best_idx: int,
+) -> pd.DataFrame:
+    """
+    Predictor-level R2-VIP.
+
+    For each input predictor j:
+        VI_j = R2_original - R2_after_setting_predictor_j_to_zero
+
+    The fitted model is held fixed. Only one predictor column is zeroed at a time.
+    This function uses a NumPy array internally to avoid making a full DataFrame copy for every predictor.
+    """
+    X_vip, y_vip = sample_xy(X_fit, y_fit, MAX_VIP_ROWS)
+
+    base_pred = fitted_model.predict(X_vip)
+    base_r2 = r2_zero_benchmark(y_vip, base_pred)
+
+    X_arr = X_vip.to_numpy(dtype=np.float64, copy=True)
+    col_to_idx = {c: i for i, c in enumerate(X_vip.columns)}
+
+    rows = []
+
+    for j, pred_col in enumerate(vip_predictor_cols, start=1):
+        if pred_col not in col_to_idx:
+            continue
+
+        col_idx = col_to_idx[pred_col]
+
+        original_col = X_arr[:, col_idx].copy()
+        X_arr[:, col_idx] = 0.0
+
+        zero_pred = fitted_model.predict(X_arr)
+        zero_r2 = r2_zero_benchmark(y_vip, zero_pred)
+
+        X_arr[:, col_idx] = original_col
+
+        vip = base_r2 - zero_r2
+
+        rows.append({
+            "model": model_name,
+            "oos_year": oos_year,
+            "best_candidate_index": best_idx,
+            "predictor": pred_col,
+            "plot_label": shorten_predictor_label(pred_col),
+            "base_r2": base_r2,
+            "r2_when_zero": zero_r2,
+            "r2_vip": vip,
+            "r2_vip_percent": 100 * vip,
+            "n_vip_rows": len(X_vip),
+        })
+
+        if j % 100 == 0:
+            print(f"{model_name} {oos_year}: VIP {j}/{len(vip_predictor_cols)}")
+
+    return pd.DataFrame(rows)
+
+# Average VIP across OOS-year refits and plot Figure 4.
+def summarize_and_plot_figure4(vip_raw: pd.DataFrame) -> pd.DataFrame:
+    vip_avg = (
+        vip_raw
+        .groupby(["model", "predictor", "plot_label"], as_index=False)
+        .agg(
+            r2_vip=("r2_vip", "mean"),
+            r2_vip_percent=("r2_vip_percent", "mean"),
+        )
+    )
+
+    vip_avg_path = RESULT_DIR / "figure4_vip_reduced_average.csv"
+    vip_avg.to_csv(vip_avg_path, index=False)
+
+    print("\nSaved Figure 4 average VIP:")
+    print(vip_avg_path)
+
+    top = (
+        vip_avg.sort_values(["model", "r2_vip"], ascending=[True, False])
+        .groupby("model")
+        .head(TOP_N_FIG4)
+        .copy()
+    )
+
+    fig, axes = plt.subplots(
+        nrows=len(FIGURE4_MODELS),
+        ncols=1,
+        figsize=(10, 3.2 * len(FIGURE4_MODELS)),
+        constrained_layout=True,
+    )
+
+    if len(FIGURE4_MODELS) == 1:
+        axes = [axes]
+
+    for ax, model_name in zip(axes, FIGURE4_MODELS):
+        temp = top[top["model"] == model_name].sort_values("r2_vip_percent")
+
+        ax.barh(temp["plot_label"], temp["r2_vip_percent"])
+        ax.set_title(model_name)
+        ax.set_xlabel("R²-VIP, percentage points")
+        ax.set_ylabel("")
+
+    fig.suptitle("Figure 4: Predictor-Level Variable Importance", fontsize=14)
+
+    png_path = RESULT_DIR / "figure4_variable_importance_reduced.png"
+    pdf_path = RESULT_DIR / "figure4_variable_importance_reduced.pdf"
+
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
+
+    print("\nSaved Figure 4:")
+    print(png_path)
+    print(pdf_path)
+
+    return vip_avg
+
+
+# ============================================================
+# 5. Annual refit: Table 1 + Figure 4
+# ============================================================
+
+# Run one model across all OOS years and save predictions/VIP inputs.
+def run_one_model(
+    df: pd.DataFrame,
+    model_name: str,
+    predictor_cols: list[str],
+    ols3_cols: list[str],
+    periods: pd.DataFrame,
+):
+    print("\n" + "=" * 80)
+    print(f"Running model: {model_name}")
+    print("=" * 80)
+
+    model_predictors = ols3_cols if model_name == "OLS-3+H" else predictor_cols
+
+    all_predictions = []
+    all_vip = []
+    tuning_rows = []
+
+    for _, row in periods.iterrows():
+        oos_year = int(row["oos_year"])
+        tr_start = int(row["training_start"])
+        tr_end = int(row["training_end"])
+        val_start = int(row["validation_start"])
+        val_end = int(row["validation_end"])
+
+        print(
+            f"\nOOS {oos_year}: "
+            f"train {tr_start}-{tr_end}, validation {val_start}-{val_end}"
+        )
+
+        train = df[(df["year"] >= tr_start) & (df["year"] <= tr_end)]
+        val = df[(df["year"] >= val_start) & (df["year"] <= val_end)]
+        oos = df[df["year"].eq(oos_year)]
+
+        if len(train) == 0 or len(val) == 0 or len(oos) == 0:
+            print(f"Skipping {oos_year}: insufficient data")
+            continue
+
+        X_train_full = train[model_predictors]
+        y_train_full = train["excess_ret"]
+
+        X_train, y_train = sample_xy(X_train_full, y_train_full, MAX_TRAIN_ROWS)
+
+        X_val = val[model_predictors]
+        y_val = val["excess_ret"]
+
+        X_train_val_full = pd.concat(
+            [train[model_predictors], val[model_predictors]],
+            axis=0,
+        )
+        y_train_val_full = pd.concat(
+            [train["excess_ret"], val["excess_ret"]],
+            axis=0,
+        )
+
+        X_train_val, y_train_val = sample_xy(
+            X_train_val_full,
+            y_train_val_full,
+            MAX_TRAIN_ROWS,
+        )
+
+        X_oos = oos[model_predictors]
+
+        print(f"Train rows used for tuning: {len(X_train):,}")
+        print(f"Validation rows: {len(X_val):,}")
+        print(f"Train+validation rows used for final fit: {len(X_train_val):,}")
+        print(f"OOS rows: {len(X_oos):,}")
+        print(f"Predictors: {len(model_predictors):,}")
+
+        best_template, best_rmse, best_idx = tune_model(
+            model_name,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+        )
+
+        tuning_rows.append({
+            "sample_period": SAMPLE_PERIOD,
+            "model": model_name,
+            "oos_year": oos_year,
+            "best_candidate_index": best_idx,
+            "validation_rmse": best_rmse,
+            "train_start": tr_start,
+            "train_end": tr_end,
+            "validation_start": val_start,
+            "validation_end": val_end,
+        })
+
+        final_model = clone(best_template)
+        final_model.fit(X_train_val, y_train_val)
+
+        pred = final_model.predict(X_oos)
+
+        pred_df = oos[["permno", "yyyymm", "year", "excess_ret"]].copy()
+        pred_df["model"] = model_name
+        pred_df["prediction"] = pred
+        pred_df["validation_rmse"] = best_rmse
+        pred_df["best_candidate_index"] = best_idx
+
+        all_predictions.append(pred_df)
+
+        if model_name in FIGURE4_MODELS:
+            print(f"Computing Figure 4 predictor-level R2-VIP for {model_name}, OOS {oos_year}...")
+
+            vip_df = compute_r2_vip_for_model(
+                fitted_model=final_model,
+                X_fit=X_train_val,
+                y_fit=y_train_val,
+                vip_predictor_cols=model_predictors,
+                model_name=model_name,
+                oos_year=oos_year,
+                best_idx=best_idx,
+            )
+
+            all_vip.append(vip_df)
+
+    if not all_predictions:
+        raise RuntimeError(f"No predictions generated for {model_name}")
+
+    predictions = pd.concat(all_predictions, ignore_index=True)
+    tuning = pd.DataFrame(tuning_rows)
+
+    vip = pd.concat(all_vip, ignore_index=True) if all_vip else pd.DataFrame()
+
+    return predictions, tuning, vip
+
+
+# ============================================================
+# 6. Main Table 1 + Figure 4 routine
+# ============================================================
+
+# Execute the full Table 1 and Figure 4 pipeline.
+def main():
+    warnings.filterwarnings("ignore")
+
+    if not DATA_2021.exists():
+        raise FileNotFoundError(
+            f"Missing file: {DATA_2021}\n"
+            "Run assignment2_build_data.py first."
+        )
+
+    print("\nLoading data...")
+    df = pd.read_parquet(DATA_2021)
+
+    df["yyyymm"] = df["yyyymm"].astype(str)
+    df["year"] = df["yyyymm"].str.slice(0, 4).astype(int)
+
+    df = df[
+        (df["year"] >= SAMPLE_START)
+        & (df["year"] <= FINAL_OOS_YEAR)
+    ].copy()
+
+    df = df.dropna(subset=["excess_ret"])
+
+    predictor_cols = get_predictor_columns(df)
+    ols3_cols = check_ols3_columns(predictor_cols)
+    periods = create_estimation_periods()
+
+    print("\nData summary:")
+    print(f"Rows: {len(df):,}")
+    print(f"Period: {df['yyyymm'].min()} to {df['yyyymm'].max()}")
+    print(f"Predictors: {len(predictor_cols):,}")
+    print(f"Predictor-level VIP columns: {len(predictor_cols):,}")
+    print(f"OOS period: {FIRST_OOS_YEAR}-{FINAL_OOS_YEAR}")
+
+    all_predictions = []
+    all_tuning = []
+    all_vip = []
+
+    for model_name in TABLE1_MODELS:
+        pred, tuning, vip = run_one_model(
+            df=df,
+            model_name=model_name,
+            predictor_cols=predictor_cols,
+            ols3_cols=ols3_cols,
+            periods=periods,
+        )
+
+        all_predictions.append(pred)
+        all_tuning.append(tuning)
+
+        pred_path = RESULT_DIR / f"predictions_{SAMPLE_PERIOD}_{safe_model_name(model_name)}.parquet"
+        pred.to_parquet(pred_path, index=False)
+        print(f"Saved predictions: {pred_path}")
+
+        tuning_path_model = RESULT_DIR / f"tuning_choices_{SAMPLE_PERIOD}_{safe_model_name(model_name)}.csv"
+        tuning.to_csv(tuning_path_model, index=False)
+        print(f"Saved tuning choices: {tuning_path_model}")
+
+        if not vip.empty:
+            all_vip.append(vip)
+
+            vip_path_model = RESULT_DIR / f"figure4_vip_{SAMPLE_PERIOD}_{safe_model_name(model_name)}.csv"
+            vip.to_csv(vip_path_model, index=False)
+            print(f"Saved model-level Figure 4 VIP: {vip_path_model}")
+
+    predictions = pd.concat(all_predictions, ignore_index=True)
+    tuning_choices = pd.concat(all_tuning, ignore_index=True)
+
+    predictions_path = RESULT_DIR / f"predictions_{SAMPLE_PERIOD}_all_models.parquet"
+    tuning_path = RESULT_DIR / f"tuning_choices_{SAMPLE_PERIOD}.csv"
+
+    predictions.to_parquet(predictions_path, index=False)
+    tuning_choices.to_csv(tuning_path, index=False)
+
+    print("\nSaved combined predictions and tuning choices:")
+    print(predictions_path)
+    print(tuning_path)
+
+    # ========================================================
+    # Table 1
+    # ========================================================
+
+    results = []
+
+    for model_name, g in predictions.groupby("model"):
+        r2 = r2_zero_benchmark(g["excess_ret"], g["prediction"])
+        mse = mean_squared_error(g["excess_ret"], g["prediction"])
+
+        results.append({
+            "sample_period": SAMPLE_PERIOD,
+            "sample": "All",
+            "model": model_name,
+            "r2_oos_percent": 100 * r2,
+            "mse": mse,
+            "n_oos_obs": len(g),
+            "oos_start": g["yyyymm"].min(),
+            "oos_end": g["yyyymm"].max(),
+        })
+
+    table1_long = pd.DataFrame(results)
+
+    table1_wide = (
+        table1_long
+        .pivot_table(
+            index=["sample_period", "sample"],
+            columns="model",
+            values="r2_oos_percent",
+        )
+        .reset_index()
+    )
+
+    ordered_cols = [
+        "sample_period",
+        "sample",
+        "OLS+H",
+        "OLS-3+H",
+        "PCR",
+        "ENet+H",
+        "RF",
+        "NN2",
+        "NN4",
+    ]
+
+    table1_wide = table1_wide[
+        [c for c in ordered_cols if c in table1_wide.columns]
+    ]
+
+    table1_long_path = RESULT_DIR / "table1_reduced_2000_2021_long.csv"
+    table1_wide_path = RESULT_DIR / "table1_reduced_2000_2021_wide.csv"
+
+    table1_long.to_csv(table1_long_path, index=False)
+    table1_wide.to_csv(table1_wide_path, index=False)
+
+    print("\n" + "=" * 90)
+    print("FINAL TABLE 1 REDUCED-SAMPLE RESULTS")
+    print("=" * 90)
+    print(table1_wide)
+
+    print("\nSaved Table 1:")
+    print(table1_long_path)
+    print(table1_wide_path)
+
+    # ========================================================
+    # Figure 4
+    # ========================================================
+
+    if all_vip:
+        vip_raw = pd.concat(all_vip, ignore_index=True)
+
+        vip_raw_path = RESULT_DIR / "figure4_vip_reduced_raw.csv"
+        vip_raw.to_csv(vip_raw_path, index=False)
+
+        print("\nSaved Figure 4 raw VIP:")
+        print(vip_raw_path)
+
+        vip_avg = summarize_and_plot_figure4(vip_raw)
+
+        print("\nTop 10 Figure 4 predictors by model:")
+        print(
+            vip_avg
+            .sort_values(["model", "r2_vip"], ascending=[True, False])
+            .groupby("model")
+            .head(10)
+            [["model", "predictor", "plot_label", "r2_vip_percent"]]
+        )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
