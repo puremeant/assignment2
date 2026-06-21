@@ -21,7 +21,8 @@ import matplotlib.pyplot as plt
 # 0. Settings
 # ============================================================
 
-BASE_DIR = Path(r"C:\Users\Assignment2")
+#### put your own path ###
+BASE_DIR = Path(r"C:\Users\Soojungkim\Assignment2")
 
 RESULT_DIR = BASE_DIR / "results"
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
