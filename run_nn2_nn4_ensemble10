@@ -1,0 +1,398 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+
+# ============================================================
+# 0. Paths and settings
+# ============================================================
+
+### put own path ###
+DATA_PATH = r"C:\Users\Soojungkim\Assignment2\output\gkx_model_data_1971_2021.parquet"
+OUT_DIR = r"C:\Users\Soojungkim\Assignment2\nn_ensemble10_outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+DATE_COL = "yyyymm"
+TARGET_COL = "excess_ret"
+
+OOS_YEARS = [2017, 2018, 2019, 2020, 2021]
+
+# GKX-style NN tuning
+L1_GRID = [1e-5, 1e-4, 1e-3]
+LR_GRID = [0.001, 0.01]
+
+BATCH_SIZE = 10000
+MAX_EPOCHS = 100
+PATIENCE = 5
+ENSEMBLE_SIZE = 10
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_layers):
+        super().__init__()
+
+        layers = []
+        current_dim = input_dim
+
+        for h in hidden_layers:
+            layers.append(nn.Linear(current_dim, h))
+            layers.append(nn.ReLU())
+            current_dim = h
+
+        layers.append(nn.Linear(current_dim, 1))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def l1_penalty(model):
+    return sum(torch.sum(torch.abs(p)) for p in model.parameters())
+
+
+def oos_r2(y_true, y_pred):
+    return 1.0 - np.sum((y_true - y_pred) ** 2) / np.sum(y_true ** 2)
+
+
+def get_splits(oos_year):
+    train_start = 2000
+    train_end = oos_year - 6
+    val_start = oos_year - 5
+    val_end = oos_year - 1
+    return train_start, train_end, val_start, val_end
+
+
+def train_single_model(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    hidden_layers,
+    lr,
+    l1_lambda,
+    seed,
+):
+    set_seed(seed)
+
+    model = MLP(X_train.shape[1], hidden_layers).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    train_dataset = TensorDataset(
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.float32),
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        drop_last=False,
+    )
+
+    X_val_t = torch.tensor(X_val, dtype=torch.float32).to(DEVICE)
+    y_val_t = torch.tensor(y_val, dtype=torch.float32).to(DEVICE)
+
+    best_val_loss = np.inf
+    best_state = None
+    patience_count = 0
+
+    for epoch in range(MAX_EPOCHS):
+        model.train()
+
+        for xb, yb in train_loader:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+
+            optimizer.zero_grad()
+            pred = model(xb)
+
+            mse = loss_fn(pred, yb)
+            loss = mse + l1_lambda * l1_penalty(model)
+
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_val_t)
+            val_loss = loss_fn(val_pred, y_val_t).item()
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {
+                k: v.detach().cpu().clone()
+                for k, v in model.state_dict().items()
+            }
+            patience_count = 0
+        else:
+            patience_count += 1
+
+        if patience_count >= PATIENCE:
+            break
+
+    model.load_state_dict(best_state)
+    return model, best_val_loss
+
+
+def predict_model(model, X):
+    model.eval()
+    preds = []
+
+    batch_size = 100000
+    X_t = torch.tensor(X, dtype=torch.float32).to(DEVICE)
+
+    with torch.no_grad():
+        for start in range(0, X.shape[0], batch_size):
+            end = start + batch_size
+            pred = model(X_t[start:end]).cpu().numpy()
+            preds.append(pred)
+
+    return np.concatenate(preds)
+
+
+# ============================================================
+# 2. Load data
+# ============================================================
+
+if DATA_PATH.lower().endswith(".parquet"):
+    df = pd.read_parquet(DATA_PATH)
+else:
+    df = pd.read_csv(DATA_PATH)
+df[DATE_COL] = df[DATE_COL].astype(int)
+df["year"] = df[DATE_COL] // 100
+
+df = df.dropna(subset=[TARGET_COL]).copy()
+
+non_predictor_cols = {
+    DATE_COL,
+    TARGET_COL,
+    "year",
+    "permno",
+    "ticker",
+    "sic2",
+    "ret",
+    "mthret",
+    "rf",
+    "excess_ret",
+    "pred",
+}
+
+predictor_cols = [
+    c for c in df.columns
+    if c not in non_predictor_cols
+    and pd.api.types.is_numeric_dtype(df[c])
+]
+
+print(f"Device: {DEVICE}")
+print(f"Number of predictors: {len(predictor_cols)}")
+
+
+# ============================================================
+# 3. NN specifications
+# ============================================================
+
+model_specs = {
+    "NN2": [32, 16],
+    "NN4": [32, 16, 8, 4],
+}
+
+all_predictions = []
+summary_rows = []
+tuning_rows = []
+
+
+# ============================================================
+# 4. Rolling OOS training
+# ============================================================
+
+for model_name, hidden_layers in model_specs.items():
+
+    print("\n" + "=" * 60)
+    print(f"Running {model_name}: hidden layers = {hidden_layers}")
+    print("=" * 60)
+
+    for oos_year in OOS_YEARS:
+
+        train_start, train_end, val_start, val_end = get_splits(oos_year)
+
+        print(f"\nOOS year {oos_year}")
+        print(f"Train {train_start}-{train_end}, Val {val_start}-{val_end}, Test {oos_year}")
+
+        train_df = df[(df["year"] >= train_start) & (df["year"] <= train_end)].copy()
+        val_df = df[(df["year"] >= val_start) & (df["year"] <= val_end)].copy()
+        test_df = df[df["year"] == oos_year].copy()
+
+        X_train_raw = train_df[predictor_cols].fillna(0.0).values
+        y_train = train_df[TARGET_COL].values.astype(np.float32)
+
+        X_val_raw = val_df[predictor_cols].fillna(0.0).values
+        y_val = val_df[TARGET_COL].values.astype(np.float32)
+
+        X_test_raw = test_df[predictor_cols].fillna(0.0).values
+        y_test = test_df[TARGET_COL].values.astype(np.float32)
+
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train_raw)
+        X_val = scaler.transform(X_val_raw)
+        X_test = scaler.transform(X_test_raw)
+
+        # ----------------------------------------------------
+        # 4.1 Validation-based hyperparameter selection
+        # ----------------------------------------------------
+
+        best_hp = None
+        best_val_loss = np.inf
+
+        for lr in LR_GRID:
+            for l1_lambda in L1_GRID:
+
+                model, val_loss = train_single_model(
+                    X_train=X_train,
+                    y_train=y_train,
+                    X_val=X_val,
+                    y_val=y_val,
+                    hidden_layers=hidden_layers,
+                    lr=lr,
+                    l1_lambda=l1_lambda,
+                    seed=12345,
+                )
+
+                print(
+                    f"{model_name} {oos_year}: "
+                    f"lr={lr}, l1={l1_lambda}, val_loss={val_loss:.6f}"
+                )
+
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_hp = {
+                        "lr": lr,
+                        "l1_lambda": l1_lambda,
+                    }
+
+        print(f"Best HP: {best_hp}, val_loss={best_val_loss:.6f}")
+
+        tuning_rows.append({
+            "model": model_name,
+            "oos_year": oos_year,
+            "best_lr": best_hp["lr"],
+            "best_l1_lambda": best_hp["l1_lambda"],
+            "best_val_loss": best_val_loss,
+        })
+
+        # ----------------------------------------------------
+        # 4.2 Ensemble = average forecasts from 10 networks
+        # ----------------------------------------------------
+
+        seed_predictions = []
+
+        for s in range(ENSEMBLE_SIZE):
+            seed = 1000 + s
+
+            model, val_loss = train_single_model(
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                hidden_layers=hidden_layers,
+                lr=best_hp["lr"],
+                l1_lambda=best_hp["l1_lambda"],
+                seed=seed,
+            )
+
+            test_pred = predict_model(model, X_test)
+            seed_predictions.append(test_pred)
+
+            print(
+                f"{model_name} {oos_year}: "
+                f"seed={seed}, val_loss={val_loss:.6f}"
+            )
+
+        seed_predictions = np.column_stack(seed_predictions)
+        ensemble_pred = seed_predictions.mean(axis=1)
+
+        year_r2 = 100 * oos_r2(y_test, ensemble_pred)
+
+        print(f"{model_name} {oos_year}: ensemble OOS R2 = {year_r2:.3f}%")
+
+        pred_df = test_df[[DATE_COL, "permno", TARGET_COL]].copy()
+        pred_df["model"] = model_name
+        pred_df["pred"] = ensemble_pred
+        pred_df["oos_year"] = oos_year
+
+        all_predictions.append(pred_df)
+
+        summary_rows.append({
+            "model": model_name,
+            "oos_year": oos_year,
+            "oos_r2_percent": year_r2,
+            "n_obs": len(test_df),
+            "best_lr": best_hp["lr"],
+            "best_l1_lambda": best_hp["l1_lambda"],
+        })
+
+
+# ============================================================
+# 5. Save outputs
+# ============================================================
+
+predictions = pd.concat(all_predictions, ignore_index=True)
+summary_by_year = pd.DataFrame(summary_rows)
+tuning = pd.DataFrame(tuning_rows)
+
+full_summary_rows = []
+
+for model_name, g in predictions.groupby("model"):
+    full_summary_rows.append({
+        "model": model_name,
+        "oos_r2_percent": 100 * oos_r2(
+            g[TARGET_COL].values,
+            g["pred"].values,
+        ),
+        "n_obs": len(g),
+    })
+
+full_summary = pd.DataFrame(full_summary_rows)
+
+predictions.to_parquet(
+    os.path.join(OUT_DIR, "predictions_NN2_NN4_ensemble10.parquet"),
+    index=False,
+)
+
+summary_by_year.to_csv(
+    os.path.join(OUT_DIR, "summary_NN2_NN4_ensemble10_by_year.csv"),
+    index=False,
+)
+
+tuning.to_csv(
+    os.path.join(OUT_DIR, "tuning_NN2_NN4_ensemble10.csv"),
+    index=False,
+)
+
+full_summary.to_csv(
+    os.path.join(OUT_DIR, "summary_NN2_NN4_ensemble10_full.csv"),
+    index=False,
+)
+
+print("\nFull-period OOS R2:")
+print(full_summary)
+
+print("\nDone.")
