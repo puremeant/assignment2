@@ -29,7 +29,8 @@ import requests
 # Paths : Paths of input and output data are set here.
 # ============================================================
 
-BASE_DIR = Path(r"C:\Users\Assignment2")
+#### put your own path ###
+BASE_DIR = Path(r"C:\Users\Soojungkim\Assignment2")
 DATA_DIR = BASE_DIR / "data"
 OUTPUT_DIR = BASE_DIR / "output"
 
