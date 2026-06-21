@@ -1,0 +1,469 @@
+# Figure 9 reduced-sample replication.
+#
+# Portfolio construction:
+# At each month, for each model:
+#   1. Sort stocks by predicted excess return.
+#   2. Form deciles.
+#   3. Buy decile 10 and sell decile 1.
+#   4. Compute realized long-short excess return using realized excess_ret.
+#
+# Reduced-sample OOS period:
+# 2017-2021
+
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 0. Settings
+# ============================================================
+
+BASE_DIR = Path(r"C:\Users\Assignment2")
+
+RESULT_DIR = BASE_DIR / "results"
+RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+SAMPLE_PERIOD = "2000_2021_reduced"
+
+PREDICTIONS_FILE = RESULT_DIR / f"predictions_{SAMPLE_PERIOD}_all_models.parquet"
+
+MACRO_FILE = BASE_DIR / "data" / "PredictorData2025.xlsx"
+
+FIGURE9_MODELS = [
+    "OLS-3+H",
+    "PCR",
+    "ENet+H",
+    "RF",
+    "NN2",
+    "NN4",
+]
+
+# NBER recession shading. Only the 2020 recession appears inside the reduced OOS period,
+# but I keep the earlier official recession periods for completeness.
+NBER_RECESSIONS = [
+    ("2001-04-01", "2001-11-01"),
+    ("2008-01-01", "2009-06-01"),
+    ("2020-03-01", "2020-04-01"),
+]
+
+
+# ============================================================
+# 1. Utility functions
+# ============================================================
+
+def yyyymm_to_date(x):
+    x = str(int(x)) if isinstance(x, (int, float, np.integer, np.floating)) else str(x)
+    return pd.to_datetime(x + "01", format="%Y%m%d")
+
+
+def convert_return_units(s: pd.Series) -> pd.Series:
+    """
+    Convert percent returns to decimal if the series appears to be in percent.
+    Example:
+        1.2  -> 0.012
+        0.01 -> 0.01
+    """
+    s = pd.to_numeric(s, errors="coerce")
+
+    median_abs = s.abs().median()
+
+    if pd.notna(median_abs) and median_abs > 0.5:
+        return s / 100.0
+
+    return s
+
+
+def assign_deciles(group: pd.DataFrame) -> pd.DataFrame:
+    """
+    Assign deciles within each model-month using prediction ranks.
+
+    Ranking first avoids many qcut problems caused by duplicate prediction values.
+    """
+    group = group.copy()
+
+    if group["prediction"].notna().sum() < 10:
+        group["decile"] = np.nan
+        return group
+
+    ranks = group["prediction"].rank(method="first")
+
+    try:
+        group["decile"] = pd.qcut(
+            ranks,
+            q=10,
+            labels=False,
+            duplicates="drop",
+        ) + 1
+    except ValueError:
+        group["decile"] = np.nan
+
+    return group
+
+
+# ============================================================
+# 2. Load Table 1 predictions
+# ============================================================
+
+def load_predictions() -> pd.DataFrame:
+    if not PREDICTIONS_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing predictions file:\n{PREDICTIONS_FILE}\n\n"
+            "Run assignment2_table1_fig4_reduced.py first."
+        )
+
+    pred = pd.read_parquet(PREDICTIONS_FILE)
+
+    required_cols = {"permno", "yyyymm", "model", "prediction", "excess_ret"}
+    missing = required_cols - set(pred.columns)
+
+    if missing:
+        raise KeyError(f"Prediction file is missing required columns: {missing}")
+
+    pred = pred[pred["model"].isin(FIGURE9_MODELS)].copy()
+
+    pred["yyyymm"] = pred["yyyymm"].astype(str)
+    pred["date"] = pred["yyyymm"].apply(yyyymm_to_date)
+
+    pred = pred.dropna(subset=["prediction", "excess_ret"])
+
+    print("\nLoaded predictions:")
+    print(f"Rows: {len(pred):,}")
+    print(f"Period: {pred['yyyymm'].min()} to {pred['yyyymm'].max()}")
+    print(f"Models: {sorted(pred['model'].unique())}")
+
+    return pred
+
+
+# ============================================================
+# 3. Construct long-short decile portfolio returns
+# ============================================================
+
+def construct_model_portfolios(pred: pd.DataFrame) -> pd.DataFrame:
+    decile_parts = []
+
+    for (model, yyyymm), group in pred.groupby(["model", "yyyymm"]):
+        group = group.copy()
+
+        if group["prediction"].notna().sum() < 10:
+            continue
+
+        ranks = group["prediction"].rank(method="first")
+
+        try:
+            group["decile"] = pd.qcut(
+                ranks,
+                q=10,
+                labels=False,
+                duplicates="drop",
+            ) + 1
+        except ValueError:
+            continue
+
+        group["model"] = model
+        group["yyyymm"] = yyyymm
+
+        decile_parts.append(group)
+
+    if len(decile_parts) == 0:
+        raise ValueError("No valid decile portfolios were created. Check prediction values.")
+
+    pred_decile = pd.concat(decile_parts, ignore_index=True)
+    pred_decile = pred_decile.dropna(subset=["decile"]).copy()
+    pred_decile["decile"] = pred_decile["decile"].astype(int)
+
+    print("\nColumns after decile assignment:")
+    print(pred_decile.columns.tolist())
+
+    decile_returns = (
+        pred_decile
+        .groupby(["model", "yyyymm", "date", "decile"], as_index=False)
+        .agg(
+            portfolio_return=("excess_ret", "mean"),
+            n_stocks=("permno", "count"),
+            avg_prediction=("prediction", "mean"),
+        )
+    )
+
+    top = decile_returns[decile_returns["decile"].eq(10)].copy()
+    bottom = decile_returns[decile_returns["decile"].eq(1)].copy()
+
+    ls = top.merge(
+        bottom,
+        on=["model", "yyyymm", "date"],
+        suffixes=("_top", "_bottom"),
+    )
+
+    ls["long_short_return"] = (
+        ls["portfolio_return_top"] - ls["portfolio_return_bottom"]
+    )
+
+    ls = ls[
+        [
+            "model",
+            "yyyymm",
+            "date",
+            "long_short_return",
+            "portfolio_return_top",
+            "portfolio_return_bottom",
+            "n_stocks_top",
+            "n_stocks_bottom",
+            "avg_prediction_top",
+            "avg_prediction_bottom",
+        ]
+    ].copy()
+
+    print("\nConstructed long-short returns:")
+    print(ls.groupby("model")["yyyymm"].agg(["min", "max", "count"]))
+
+    return ls
+
+
+# ============================================================
+# 4. Load SP500 - Rf benchmark
+# ============================================================
+
+def load_sp500_excess() -> pd.DataFrame:
+    if not MACRO_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing macro file:\n{MACRO_FILE}\n\n"
+            "Put PredictorData2025.xlsx in the Assignment2 folder."
+        )
+
+    macro = pd.read_excel(MACRO_FILE, sheet_name="Monthly")
+
+    required_cols = {"yyyymm", "CRSP_SPvw", "Rfree"}
+    missing = required_cols - set(macro.columns)
+
+    if missing:
+        raise KeyError(f"Macro file is missing required columns: {missing}")
+
+    macro = macro[["yyyymm", "CRSP_SPvw", "Rfree"]].copy()
+
+    macro["yyyymm"] = macro["yyyymm"].astype(int).astype(str)
+    macro["date"] = macro["yyyymm"].apply(yyyymm_to_date)
+
+    macro["CRSP_SPvw"] = convert_return_units(macro["CRSP_SPvw"])
+    macro["Rfree"] = convert_return_units(macro["Rfree"])
+
+    macro["sp500_excess_return"] = macro["CRSP_SPvw"] - macro["Rfree"]
+
+    macro = macro[
+        ["yyyymm", "date", "sp500_excess_return"]
+    ].dropna()
+
+    print("\nLoaded SP500 - Rf benchmark:")
+    print(f"Period: {macro['yyyymm'].min()} to {macro['yyyymm'].max()}")
+
+    return macro
+
+
+# ============================================================
+# 5. Cumulative returns
+# ============================================================
+
+def build_cumulative_returns(ls: pd.DataFrame, sp500: pd.DataFrame):
+    """
+    Build cumulative returns for:
+      1. Long position: top decile portfolio
+      2. Short position: bottom decile portfolio
+      3. Long-short portfolio: top decile minus bottom decile
+      4. SP500 - Rf benchmark
+
+    The original paper's Figure 9 plots long and short positions separately:
+      solid line = long
+      dashed line = short
+    """
+
+    model_monthly = ls[
+        [
+            "model",
+            "yyyymm",
+            "date",
+            "portfolio_return_top",
+            "portfolio_return_bottom",
+            "long_short_return",
+        ]
+    ].copy()
+
+    # Long leg: top decile
+    long_wide = model_monthly.pivot_table(
+        index=["yyyymm", "date"],
+        columns="model",
+        values="portfolio_return_top",
+    )
+
+    long_wide.columns = [f"{c}_long" for c in long_wide.columns]
+
+    # Short leg: bottom decile
+    # To match the original paper's visual convention, plot the short position
+    # as the cumulative payoff from shorting the bottom portfolio: - bottom return.
+    short_wide = model_monthly.pivot_table(
+        index=["yyyymm", "date"],
+        columns="model",
+        values="portfolio_return_bottom",
+    )
+
+    short_wide = -short_wide
+    short_wide.columns = [f"{c}_short" for c in short_wide.columns]
+
+    # Long-short spread: top minus bottom
+    ls_wide = model_monthly.pivot_table(
+        index=["yyyymm", "date"],
+        columns="model",
+        values="long_short_return",
+    )
+
+    ls_wide.columns = [f"{c}_long_short" for c in ls_wide.columns]
+
+    monthly = pd.concat([long_wide, short_wide, ls_wide], axis=1).reset_index()
+
+    sp500_sub = sp500[["yyyymm", "date", "sp500_excess_return"]].copy()
+
+    monthly = monthly.merge(
+        sp500_sub,
+        on=["yyyymm", "date"],
+        how="left",
+    )
+
+    monthly = monthly.sort_values("date").reset_index(drop=True)
+
+    return_cols = [c for c in monthly.columns if c not in ["yyyymm", "date"]]
+
+    cumulative = monthly[["yyyymm", "date"]].copy()
+
+    for col in return_cols:
+        cumulative[col] = (1.0 + monthly[col].fillna(0.0)).cumprod()
+
+    return monthly, cumulative
+
+
+# ============================================================
+# 6. Plot Figure 9
+# ============================================================
+
+def plot_figure9(cumulative: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(13, 7))
+
+    models = [
+        "OLS-3+H",
+        "PCR",
+        "ENet+H",
+        "RF",
+        "NN2",
+        "NN4",
+    ]
+
+    # Use consistent colors by model
+    color_cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    model_colors = {
+        model: color_cycle[i % len(color_cycle)]
+        for i, model in enumerate(models)
+    }
+
+    for model in models:
+        long_col = f"{model}_long"
+        short_col = f"{model}_short"
+
+        if long_col in cumulative.columns:
+            ax.plot(
+                cumulative["date"],
+                cumulative[long_col],
+                label=f"{model} long",
+                linewidth=1.8,
+                linestyle="-",
+                color=model_colors[model],
+            )
+
+        if short_col in cumulative.columns:
+            ax.plot(
+                cumulative["date"],
+                cumulative[short_col],
+                label=f"{model} short",
+                linewidth=1.5,
+                linestyle="--",
+                color=model_colors[model],
+            )
+
+    if "sp500_excess_return" in cumulative.columns:
+        ax.plot(
+            cumulative["date"],
+            cumulative["sp500_excess_return"],
+            label="SP500 - Rf",
+            linewidth=2.3,
+            linestyle="-",
+            color="black",
+        )
+
+    for start, end in NBER_RECESSIONS:
+        start_date = pd.to_datetime(start)
+        end_date = pd.to_datetime(end)
+
+        if end_date >= cumulative["date"].min() and start_date <= cumulative["date"].max():
+            ax.axvspan(start_date, end_date, alpha=0.15, color="gray")
+
+    ax.set_title("Figure 9: Cumulative Returns of Long and Short Prediction Portfolios")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Cumulative return, initial value = 1")
+
+    ax.axhline(1.0, color="black", linewidth=0.8, alpha=0.5)
+    ax.grid(True, alpha=0.3)
+
+    ax.legend(
+        ncol=2,
+        fontsize=8,
+        loc="best",
+        frameon=True,
+    )
+
+    png_path = RESULT_DIR / "figure9_long_short_positions_reduced.png"
+    pdf_path = RESULT_DIR / "figure9_long_short_positions_reduced.pdf"
+
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
+
+    print("\nSaved Figure 9:")
+    print(png_path)
+    print(pdf_path)
+
+
+# ============================================================
+# 7. Main
+# ============================================================
+
+def main():
+    pred = load_predictions()
+
+    ls = construct_model_portfolios(pred)
+
+    sp500 = load_sp500_excess()
+
+    monthly, cumulative = build_cumulative_returns(ls, sp500)
+
+    monthly_path = RESULT_DIR / "figure9_monthly_long_short_positions_reduced.csv"
+    cumulative_path = RESULT_DIR / "figure9_cumulative_long_short_positions_reduced.csv"
+
+    monthly.to_csv(monthly_path, index=False)
+    cumulative.to_csv(cumulative_path, index=False)
+
+    print("\nSaved Figure 9 data:")
+    print(monthly_path)
+    print(cumulative_path)
+
+    print("\nMonthly return summary:")
+    print(
+        monthly
+        .drop(columns=["yyyymm", "date"])
+        .describe()
+        .T[["mean", "std", "min", "max"]]
+    )
+
+    plot_figure9(cumulative)
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
