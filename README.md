@@ -64,5 +64,5 @@ DATA_PATH = r"C:\Users\Assignment2\output\gkx_model_data_1971_2021.parquet"
 This is not a full-scale replication of Gu, Kelly, and Xiu (2020). It is a reduced-sample assignment project using a shorter 2017--2021 OOS period. The results should therefore be interpreted as a compact replication exercise rather than a direct reproduction of the original paper.
 
 ## References
-Gu, S., Kelly, B., and Xiu, D. (2020). Empirical Asset Pricing via Machine Learning. *The Review of Financial Studies*, 33(5), 2223--2273.
-Welch, I., and Goyal, A. (2008). A Comprehensive Look at the Empirical Performance of Equity Premium Prediction. *The Review of Financial Studies*, 21(4), 1455--1508.
+* Gu, S., Kelly, B., and Xiu, D. (2020). Empirical Asset Pricing via Machine Learning. *The Review of Financial Studies*, 33(5), 2223--2273.
+* Welch, I., and Goyal, A. (2008). A Comprehensive Look at the Empirical Performance of Equity Premium Prediction. *The Review of Financial Studies*, 21(4), 1455--1508.
